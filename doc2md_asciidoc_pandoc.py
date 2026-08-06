@@ -461,6 +461,127 @@ def _require(module_name: str, install_hint: Optional[str] = None):
         raise MissingDependencyError(module_name, hint) from e
 
 
+def _expand_configured_path(value: str) -> str:
+    return os.path.expandvars(os.path.expanduser(value or "")).strip()
+
+
+def _is_auto_value(value: str) -> bool:
+    return not value or value.strip().lower() in {"auto", "detect"}
+
+
+def _first_existing_file(candidates: Iterable[Path]) -> Optional[str]:
+    for candidate in candidates:
+        try:
+            if candidate and candidate.is_file():
+                return str(candidate)
+        except OSError:
+            continue
+    return None
+
+
+def _first_existing_dir(candidates: Iterable[Path]) -> Optional[str]:
+    for candidate in candidates:
+        try:
+            if candidate and candidate.is_dir():
+                return str(candidate)
+        except OSError:
+            continue
+    return None
+
+
+def _detect_pandoc_bin(configured: str) -> str:
+    configured = _expand_configured_path(configured)
+    if not _is_auto_value(configured):
+        configured_path = Path(configured)
+        if configured_path.is_file():
+            return str(configured_path)
+        found = shutil.which(configured)
+        if found:
+            return found
+        if configured.lower() != "pandoc":
+            return configured
+
+    found = shutil.which("pandoc")
+    if found:
+        return found
+
+    candidates = [
+        Path(os.environ.get("LOCALAPPDATA", "")) / "Pandoc" / "pandoc.exe",
+        Path(os.environ.get("ProgramFiles", "")) / "Pandoc" / "pandoc.exe",
+        Path(os.environ.get("ProgramFiles(x86)", "")) / "Pandoc" / "pandoc.exe",
+        Path(os.environ.get("ProgramData", "")) / "chocolatey" / "bin" / "pandoc.exe",
+    ]
+    return _first_existing_file(candidates) or "pandoc"
+
+
+def _detect_tesseract_cmd(configured: str) -> str:
+    configured = _expand_configured_path(configured)
+    if not _is_auto_value(configured):
+        configured_path = Path(configured)
+        if configured_path.is_file():
+            return str(configured_path)
+        found = shutil.which(configured)
+        if found:
+            return found
+        if configured.lower() != "tesseract":
+            return configured
+
+    found = shutil.which("tesseract")
+    if found:
+        return found
+
+    candidates = [
+        Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "Tesseract-OCR" / "tesseract.exe",
+        Path(os.environ.get("ProgramFiles", "")) / "Tesseract-OCR" / "tesseract.exe",
+        Path(os.environ.get("ProgramFiles(x86)", "")) / "Tesseract-OCR" / "tesseract.exe",
+        Path(os.environ.get("ProgramData", "")) / "chocolatey" / "bin" / "tesseract.exe",
+    ]
+    return _first_existing_file(candidates) or "tesseract"
+
+
+def _detect_tessdata_dir(configured: str, tesseract_cmd: str) -> str:
+    configured = _expand_configured_path(configured)
+    if not _is_auto_value(configured):
+        configured_path = Path(configured)
+        return str(configured_path) if configured_path.is_dir() else configured
+
+    env_tessdata = _expand_configured_path(os.environ.get("TESSDATA_PREFIX", ""))
+    env_candidates: List[Path] = []
+    if env_tessdata:
+        env_path = Path(env_tessdata)
+        env_candidates.extend([env_path, env_path / "tessdata"])
+
+    tesseract_path = Path(_expand_configured_path(tesseract_cmd))
+    candidates = env_candidates + [
+        tesseract_path.parent / "tessdata" if tesseract_path.name else Path(),
+        Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "Tesseract-OCR" / "tessdata",
+        Path(os.environ.get("ProgramFiles", "")) / "Tesseract-OCR" / "tessdata",
+        Path(os.environ.get("ProgramFiles(x86)", "")) / "Tesseract-OCR" / "tessdata",
+    ]
+    return _first_existing_dir(candidates) or ""
+
+
+def resolve_external_tools(options: ConversionOptions) -> ConversionOptions:
+    resolved = options
+
+    if options.use_pandoc:
+        pandoc_bin = _detect_pandoc_bin(options.pandoc_bin)
+        if pandoc_bin != options.pandoc_bin:
+            resolved = replace(resolved, pandoc_bin=pandoc_bin)
+
+    if options.pdf_ocr:
+        tesseract_cmd = _detect_tesseract_cmd(options.pdf_ocr_tesseract)
+        tessdata_dir = _detect_tessdata_dir(options.pdf_ocr_tessdata_dir, tesseract_cmd)
+        if tesseract_cmd != options.pdf_ocr_tesseract or tessdata_dir != options.pdf_ocr_tessdata_dir:
+            resolved = replace(
+                resolved,
+                pdf_ocr_tesseract=tesseract_cmd,
+                pdf_ocr_tessdata_dir=tessdata_dir,
+            )
+
+    return resolved
+
+
 def activate_pymupdf_layout() -> None:
     """
     pymupdf.layout を有効化（入っていない環境でも落とさない）。
@@ -1583,7 +1704,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     g_pandoc = p.add_argument_group("Pandoc (optional)")
     g_pandoc.add_argument("--use-pandoc", action="store_true", help="Pandoc による高品質変換を有効化（利用不可なら起動時に警告→フォールバック）")
-    g_pandoc.add_argument("--pandoc-bin", default="pandoc", help="pandoc 実行ファイル名/パス (default: pandoc)")
+    g_pandoc.add_argument("--pandoc-bin", default="pandoc", help="pandoc 実行ファイル名/パス。auto で標準インストール先を自動検出 (default: pandoc)")
 
     g_pdf = p.add_argument_group("PDF")
     g_pdf.add_argument("--pdf-engine", default="auto", choices=[e.value for e in PdfEngine], help="PDF 変換エンジン (auto|pymupdf4llm|pymupdf_text)")
@@ -1599,8 +1720,8 @@ def _build_parser() -> argparse.ArgumentParser:
     g_ocr.add_argument("--pdf-ocr-dpi", type=int, default=300, help="レンダリングDPI（既定: 300）")
     g_ocr.add_argument("--pdf-ocr-psm", type=int, default=6, help="Tesseract PSM（既定: 6）")
     g_ocr.add_argument("--pdf-ocr-oem", type=int, default=3, help="Tesseract OEM（既定: 3）")
-    g_ocr.add_argument("--pdf-ocr-tesseract", default="", help="tesseract 実行ファイルのパス（Windows等で必要な場合）")
-    g_ocr.add_argument("--pdf-ocr-tessdata", default="", help="tessdata ディレクトリ（任意）")
+    g_ocr.add_argument("--pdf-ocr-tesseract", default="", help="tesseract 実行ファイルのパス。auto で標準インストール先を自動検出")
+    g_ocr.add_argument("--pdf-ocr-tessdata", default="", help="tessdata ディレクトリ。auto で標準インストール先を自動検出")
     g_ocr.add_argument("--pdf-ocr-debug-images", action="store_true", help="前処理後の画像を assets に保存")
     g_ocr.add_argument("--pdf-ocr-threshold", type=int, default=160, help="2値化しきい値（既定: 160）")
     g_ocr.add_argument("--pdf-ocr-contrast", type=float, default=1.8, help="コントラスト強調率（既定: 1.8）")
@@ -1675,6 +1796,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     activate_pymupdf_layout()
 
     options = ConversionOptions.from_args(args)
+    options = resolve_external_tools(options)
 
     # --use-pandoc 指定時は「起動直後に一度だけ」pandoc の可用性チェック
     if options.use_pandoc:
@@ -1687,6 +1809,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             options = replace(options, use_pandoc=False)
         else:
             logger.info(f"pandoc available: {ver}")
+
+    if options.pdf_ocr:
+        tesseract_label = options.pdf_ocr_tesseract or "tesseract"
+        tessdata_label = options.pdf_ocr_tessdata_dir or "(default)"
+        logger.info(f"tesseract candidate: {tesseract_label}")
+        logger.info(f"tessdata candidate: {tessdata_label}")
 
     conv = DocumentConverter()
 

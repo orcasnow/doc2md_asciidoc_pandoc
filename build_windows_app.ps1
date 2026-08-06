@@ -1,5 +1,6 @@
 param(
     [switch]$OneFile,
+    [switch]$OneDir,
     [switch]$SkipInstall
 )
 
@@ -13,9 +14,36 @@ if (-not $SkipInstall) {
     python -m pip install -r requirements-build.txt
 }
 
-$mode = "--onedir"
+$oneFileMode = -not $OneDir
 if ($OneFile) {
-    $mode = "--onefile"
+    $oneFileMode = $true
+}
+
+$mode = "--onefile"
+if (-not $oneFileMode) {
+    $mode = "--onedir"
+}
+
+$DistRoot = Join-Path $Root "dist"
+$DistFull = [System.IO.Path]::GetFullPath($DistRoot)
+if ($oneFileMode) {
+    $staleDir = Join-Path $DistRoot "doc2md-drop"
+    if (Test-Path -LiteralPath $staleDir) {
+        $staleFull = [System.IO.Path]::GetFullPath($staleDir)
+        if ($staleFull.StartsWith($DistFull + [System.IO.Path]::DirectorySeparatorChar)) {
+            Remove-Item -LiteralPath $staleDir -Recurse -Force
+        }
+    }
+} else {
+    foreach ($staleFileName in @("doc2md-drop.exe", "doc2md-drop.ini")) {
+        $staleFile = Join-Path $DistRoot $staleFileName
+        if (Test-Path -LiteralPath $staleFile) {
+            $staleFull = [System.IO.Path]::GetFullPath($staleFile)
+            if ($staleFull.StartsWith($DistFull + [System.IO.Path]::DirectorySeparatorChar)) {
+                Remove-Item -LiteralPath $staleFile -Force
+            }
+        }
+    }
 }
 
 $pyinstallerArgs = @(
@@ -71,7 +99,7 @@ if ($LASTEXITCODE -ne 0) {
 
 $configSource = Join-Path $Root "doc2md-drop.ini"
 if (Test-Path -LiteralPath $configSource) {
-    if ($OneFile) {
+    if ($oneFileMode) {
         $configTarget = Join-Path (Join-Path $Root "dist") "doc2md-drop.ini"
     } else {
         $configTarget = Join-Path (Join-Path (Join-Path $Root "dist") "doc2md-drop") "doc2md-drop.ini"
@@ -82,8 +110,10 @@ if (Test-Path -LiteralPath $configSource) {
 
 Write-Host ""
 Write-Host "Build complete."
-if ($OneFile) {
+if ($oneFileMode) {
     Write-Host "EXE: $Root\dist\doc2md-drop.exe"
+    Write-Host "INI: $Root\dist\doc2md-drop.ini"
 } else {
     Write-Host "EXE: $Root\dist\doc2md-drop\doc2md-drop.exe"
+    Write-Host "INI: $Root\dist\doc2md-drop\doc2md-drop.ini"
 }
