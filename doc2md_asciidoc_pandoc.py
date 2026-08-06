@@ -32,11 +32,14 @@ import inspect
 import json
 import logging
 import os
+import posixpath
 import re
 import shutil
 import subprocess
 import sys
 import traceback
+import zipfile
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
@@ -945,16 +948,23 @@ class PDFConverter(BaseConverter):
         params = sig.parameters
 
         kwargs: Dict[str, Any] = {}
+        image_output_requested = False
         if "write_images" in params:
             kwargs["write_images"] = bool(options.extract_images)
         if "image_path" in params:
             kwargs["image_path"] = str(plan.image_dir_abs)
+            image_output_requested = image_output_requested or bool(options.extract_images)
         elif "image_dir" in params:
             kwargs["image_dir"] = str(plan.image_dir_abs)
+            image_output_requested = image_output_requested or bool(options.extract_images)
         elif "output_dir" in params:
             kwargs["output_dir"] = str(plan.image_dir_abs)
+            image_output_requested = image_output_requested or bool(options.extract_images)
         if "pages" in params and options.pdf_max_pages is not None:
             kwargs["pages"] = list(range(int(options.pdf_max_pages)))
+
+        if image_output_requested:
+            _ensure_dir(plan.image_dir_abs)
 
         logger.debug(f"pymupdf4llm.to_markdown kwargs: {kwargs}")
         md = pymupdf4llm.to_markdown(str(input_path), **kwargs)
@@ -965,10 +975,6 @@ class PDFConverter(BaseConverter):
         warnings: List[WarningEntry] = []
 
         try:
-            _ensure_dir(plan.assets_dir)
-            if options.extract_images:
-                _ensure_dir(plan.image_dir_abs)
-
             meta_extra = self._pdf_metadata(input_path)
             title = meta_extra.get("pdf_title") or input_path.stem
             meta = build_base_meta(options, self.kind, input_path, title=title, extra=meta_extra)
@@ -1096,15 +1102,22 @@ class PDFConverter(BaseConverter):
 class WordConverter(BaseConverter):
     kind = "word"
 
+    def _docx_has_media(self, input_path: Path) -> bool:
+        try:
+            with zipfile.ZipFile(input_path) as zf:
+                return any(
+                    name.startswith("word/media/") and not name.endswith("/")
+                    for name in zf.namelist()
+                )
+        except Exception as e:
+            logger.debug(f"docx media detection skipped: {e}")
+            return False
+
     def convert(self, input_path: Path, plan: OutputPlan, options: ConversionOptions) -> ConversionResult:
         res = ConversionResult(input_path=input_path, output_path=plan.output_path)
         warnings: List[WarningEntry] = []
 
         try:
-            _ensure_dir(plan.assets_dir)
-            if options.extract_images:
-                _ensure_dir(plan.image_dir_abs)
-
             meta = build_base_meta(options, self.kind, input_path, title=input_path.stem)
 
             # Pandoc direct (preferred)
@@ -1112,7 +1125,7 @@ class WordConverter(BaseConverter):
                 try:
                     to_fmt = "gfm" if options.output_format == OutputFormat.MD else "asciidoc"
                     extract_media = None
-                    if options.extract_images:
+                    if options.extract_images and self._docx_has_media(input_path):
                         extract_media = str(Path(plan.assets_dir.name) / options.images_subdir).replace("\\", "/")
 
                     body = _pandoc_convert_file(
@@ -1155,6 +1168,7 @@ class WordConverter(BaseConverter):
                 fname = f"image_{hashlib.md5(data).hexdigest()[:12]}{ext}"
                 out_abs = plan.image_dir_abs / fname
                 out_rel = plan.image_dir_rel / fname
+                _ensure_dir(plan.image_dir_abs)
                 out_abs.write_bytes(data)
                 return {"src": str(out_rel).replace("\\", "/")}
 
@@ -1195,14 +1209,211 @@ class WordConverter(BaseConverter):
 class ExcelConverter(BaseConverter):
     kind = "excel"
 
+    _XLSX_MAIN_NS = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+    _XLSX_REL_NS = "{http://schemas.openxmlformats.org/package/2006/relationships}"
+    _XLSX_OFFICE_REL_NS = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+
+    def _xlsx_rels_path(self, part_path: str) -> str:
+        part_dir = posixpath.dirname(part_path)
+        part_name = posixpath.basename(part_path)
+        return posixpath.join(part_dir, "_rels", f"{part_name}.rels")
+
+    def _xlsx_join_target(self, source_dir: str, target: str) -> str:
+        target = (target or "").replace("\\", "/")
+        if target.startswith("/"):
+            return posixpath.normpath(target.lstrip("/"))
+        return posixpath.normpath(posixpath.join(source_dir, target))
+
+    def _xlsx_relationships(self, zf: zipfile.ZipFile, rels_path: str) -> Dict[str, Dict[str, str]]:
+        if rels_path not in zf.namelist():
+            return {}
+        source_dir = posixpath.dirname(posixpath.dirname(rels_path))
+        try:
+            root = ET.fromstring(zf.read(rels_path))
+        except Exception:
+            return {}
+
+        rels: Dict[str, Dict[str, str]] = {}
+        for rel in root.findall(f"{self._XLSX_REL_NS}Relationship"):
+            rid = rel.attrib.get("Id")
+            target = rel.attrib.get("Target", "")
+            if not rid or not target or rel.attrib.get("TargetMode") == "External":
+                continue
+            rels[rid] = {
+                "target": self._xlsx_join_target(source_dir, target),
+                "type": rel.attrib.get("Type", ""),
+            }
+        return rels
+
+    def _xlsx_sheet_paths(self, zf: zipfile.ZipFile) -> Dict[str, str]:
+        if "xl/workbook.xml" not in zf.namelist():
+            return {}
+        try:
+            root = ET.fromstring(zf.read("xl/workbook.xml"))
+        except Exception:
+            return {}
+
+        workbook_rels = self._xlsx_relationships(zf, "xl/_rels/workbook.xml.rels")
+        sheets: Dict[str, str] = {}
+        for sheet in root.findall(f".//{self._XLSX_MAIN_NS}sheet"):
+            rid = sheet.attrib.get(f"{self._XLSX_OFFICE_REL_NS}id")
+            name = sheet.attrib.get("name", "")
+            target = workbook_rels.get(rid or "", {}).get("target")
+            if target and name:
+                sheets[target] = name
+        return sheets
+
+    def _xlsx_cell_ref(self, col_zero_based: int, row_zero_based: int) -> str:
+        n = col_zero_based + 1
+        letters = ""
+        while n:
+            n, rem = divmod(n - 1, 26)
+            letters = chr(65 + rem) + letters
+        return f"{letters}{row_zero_based + 1}"
+
+    def _xlsx_drawing_occurrences(
+        self,
+        zf: zipfile.ZipFile,
+        drawing_path: str,
+        sheet_name: str,
+    ) -> List[Dict[str, str]]:
+        drawing_rels = self._xlsx_relationships(zf, self._xlsx_rels_path(drawing_path))
+        if drawing_path not in zf.namelist():
+            return []
+
+        try:
+            root = ET.fromstring(zf.read(drawing_path))
+        except Exception:
+            return []
+
+        ns = {
+            "xdr": "http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing",
+            "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
+            "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+        }
+        occurrences: List[Dict[str, str]] = []
+        for anchor in root:
+            tag = anchor.tag.rsplit("}", 1)[-1]
+            if tag not in {"oneCellAnchor", "twoCellAnchor", "absoluteAnchor"}:
+                continue
+
+            cell = ""
+            from_el = anchor.find("xdr:from", ns)
+            if from_el is not None:
+                col_el = from_el.find("xdr:col", ns)
+                row_el = from_el.find("xdr:row", ns)
+                try:
+                    col = int(col_el.text) if col_el is not None and col_el.text is not None else 0
+                    row = int(row_el.text) if row_el is not None and row_el.text is not None else 0
+                    cell = self._xlsx_cell_ref(col, row)
+                except ValueError:
+                    cell = ""
+
+            blip = anchor.find(".//a:blip", ns)
+            rid = ""
+            if blip is not None:
+                rid = blip.attrib.get(f"{self._XLSX_OFFICE_REL_NS}embed", "") or blip.attrib.get(f"{self._XLSX_OFFICE_REL_NS}link", "")
+            media_path = drawing_rels.get(rid, {}).get("target")
+            if media_path and media_path.startswith("xl/media/"):
+                occurrences.append({"sheet": sheet_name, "cell": cell, "source": media_path})
+        return occurrences
+
+    def _xlsx_image_occurrences(self, zf: zipfile.ZipFile) -> List[Dict[str, str]]:
+        sheet_paths = self._xlsx_sheet_paths(zf)
+        occurrences: List[Dict[str, str]] = []
+        seen: set[Tuple[str, str, str]] = set()
+
+        for sheet_path, sheet_name in sheet_paths.items():
+            sheet_rels = self._xlsx_relationships(zf, self._xlsx_rels_path(sheet_path))
+            for rel in sheet_rels.values():
+                if "drawing" not in rel.get("type", ""):
+                    continue
+                drawing_path = rel.get("target", "")
+                for occ in self._xlsx_drawing_occurrences(zf, drawing_path, sheet_name):
+                    key = (occ.get("sheet", ""), occ.get("cell", ""), occ.get("source", ""))
+                    if key not in seen:
+                        occurrences.append(occ)
+                        seen.add(key)
+
+        if occurrences:
+            return occurrences
+
+        return [
+            {"sheet": "", "cell": "", "source": name}
+            for name in zf.namelist()
+            if name.startswith("xl/media/") and not name.endswith("/")
+        ]
+
+    def _extract_xlsx_images(
+        self,
+        input_path: Path,
+        plan: OutputPlan,
+        options: ConversionOptions,
+        warnings: List[WarningEntry],
+    ) -> Tuple[str, str, Dict[str, Any]]:
+        if input_path.suffix.lower() != ".xlsx" or not options.extract_images:
+            return "", "", {"excel_images": 0}
+
+        try:
+            with zipfile.ZipFile(input_path) as zf:
+                occurrences = self._xlsx_image_occurrences(zf)
+                media_sources = []
+                seen_sources: set[str] = set()
+                for occ in occurrences:
+                    source = occ.get("source", "")
+                    if source and source not in seen_sources:
+                        media_sources.append(source)
+                        seen_sources.add(source)
+
+                if not media_sources:
+                    return "", "", {"excel_images": 0}
+
+                _ensure_dir(plan.image_dir_abs)
+                rel_by_source: Dict[str, str] = {}
+                for source in media_sources:
+                    suffix = Path(source).suffix or ".bin"
+                    stem = _slugify_filename(Path(source).stem)
+                    out_abs = _unique_path(plan.image_dir_abs / f"{stem}{suffix}")
+                    out_abs.write_bytes(zf.read(source))
+                    rel_by_source[source] = str((plan.image_dir_rel / out_abs.name)).replace("\\", "/")
+        except Exception as e:
+            _warn(warnings, "excel_image_extract_failed", str(e))
+            return "", "", {"excel_images": 0}
+
+        md_parts = ["## Extracted Images\n"]
+        adoc_parts = ["== Extracted Images\n"]
+        current_sheet: Optional[str] = None
+        for i, occ in enumerate(occurrences, start=1):
+            source = occ.get("source", "")
+            rel_path = rel_by_source.get(source)
+            if not rel_path:
+                continue
+            sheet = occ.get("sheet", "")
+            cell = occ.get("cell", "")
+            if sheet and sheet != current_sheet:
+                md_parts.append(f"### Sheet: {sheet}\n")
+                adoc_parts.append(f"=== Sheet: {sheet}\n")
+                current_sheet = sheet
+            label_bits = [bit for bit in (sheet, cell, f"image {i}") if bit]
+            label = " ".join(label_bits)
+            md_parts.append(f"![{label}]({rel_path})\n\n")
+            adoc_parts.append(f"image::{rel_path}[{label}]\n\n")
+
+        return (
+            "\n".join(md_parts).rstrip() + "\n",
+            "\n".join(adoc_parts).rstrip() + "\n",
+            {"excel_images": len(media_sources)},
+        )
+
     def convert(self, input_path: Path, plan: OutputPlan, options: ConversionOptions) -> ConversionResult:
         res = ConversionResult(input_path=input_path, output_path=plan.output_path)
         warnings: List[WarningEntry] = []
 
         try:
-            _ensure_dir(plan.assets_dir)
-
             meta = build_base_meta(options, self.kind, input_path, title=input_path.stem)
+            image_md, image_adoc, image_stats = self._extract_xlsx_images(input_path, plan, options, warnings)
+            if image_stats.get("excel_images"):
+                meta["image_count"] = image_stats["excel_images"]
 
             # Pandoc direct for xlsx when enabled
             if options.use_pandoc and input_path.suffix.lower() == ".xlsx":
@@ -1220,12 +1431,18 @@ class ExcelConverter(BaseConverter):
                     meta["engine"] = "pandoc"
                     meta["pandoc_version"] = _pandoc_version(options.pandoc_bin)
                     if options.output_format == OutputFormat.ADOC:
+                        if image_adoc:
+                            body = body.rstrip() + "\n\n" + image_adoc
+                    else:
+                        if image_md:
+                            body = body.rstrip() + "\n\n" + image_md
+                    if options.output_format == OutputFormat.ADOC:
                         _write_asciidoc_raw(plan.output_path, body, meta, options)
                     else:
                         _write_markdown(plan.output_path, body, meta, options)
                     res.success = True
                     res.warnings = warnings
-                    res.stats.update({"engine": "pandoc"})
+                    res.stats.update({"engine": "pandoc", **image_stats})
                     return res
                 except Exception as e:
                     _warn(warnings, "pandoc_xlsx_fallback", str(e))
@@ -1274,11 +1491,13 @@ class ExcelConverter(BaseConverter):
             meta["sheet_names"] = sheet_names
 
             md = "\n".join(parts).rstrip() + "\n"
+            if image_md:
+                md = md.rstrip() + "\n\n" + image_md
             _write_document(plan.output_path, md, meta, options, warnings)
 
             res.success = True
             res.warnings = warnings
-            res.stats.update({"engine": "pandas", "sheets": len(sheet_names)})
+            res.stats.update({"engine": "pandas", "sheets": len(sheet_names), **image_stats})
             return res
 
         except Exception as e:
