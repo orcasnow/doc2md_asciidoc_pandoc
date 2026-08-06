@@ -1,0 +1,11 @@
+pymupdf
+pymupdf4llm
+pymupdf-layout
+pandas
+openpyxl
+xlrd
+mammoth
+markdownify
+pillow
+pytesseract
+tabulate

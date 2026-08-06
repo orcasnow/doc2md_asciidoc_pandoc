@@ -1,0 +1,10 @@
+:tool: doc2md
+:tool_version: 2.0.1
+:type: excel
+:source_type: excel
+:source_file: 個別ICカード権限一挙登録一覧（NTT品川TWINSデータ棟10階８Z開発環境）.xlsx
+:title: 個別ICカード権限一挙登録一覧（NTT品川TWINSデータ棟10階８Z開発環境）
+:converted_at: 2026-07-21T02:58:08.346195+00:00
+:sha256: c4c319eaa1276313643b342aa7795c18aee817dd73352a99b8df3b07d2b241d5
+:engine: pandoc
+:pandoc_version: pandoc 3.10
