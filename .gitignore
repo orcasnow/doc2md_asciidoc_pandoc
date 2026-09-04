@@ -55,3 +55,8 @@ Thumbs.db
 desktop.ini
 .vscode/
 .idea/
+pandoc-3.10-windows-x86_64.msi
+tesseract-ocr-w64-setup-5.5.3.20260724.exe
+config_test_output_pandoc/
+config_test_output_pandas/
+config_test_output/
